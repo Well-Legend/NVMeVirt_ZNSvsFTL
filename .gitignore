@@ -1,0 +1,12 @@
+build/
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+Module.symvers
+modules.order
+__pycache__/
+.DS_Store
+*.o.d
+.tmp_versions/

@@ -1,0 +1,22 @@
+--- a/zns_ftl.c
++++ b/zns_ftl.c
+@@ -238,7 +238,7 @@
+ 		break;
+ 	}
+ 	// 印出目前統計狀況
+-    #printk(KERN_INFO "[ZNS] Opcode=%d | Active IOs=%d | Max Active=%d | Total W=%d | Total R=%d\n",
++    printk(KERN_INFO "[ZNS] Opcode=%d | Active IOs=%d | Max Active=%d | Total W=%d | Total R=%d\n",
+        cmd->common.opcode,
+        atomic_read(&active_ios),
+        atomic_read(&max_active_ios),
+--- a/zns_read_write.c
++++ b/zns_read_write.c
+@@ -387,7 +387,7 @@
+ 
+ bool zns_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
+ {
+-	#printk("hello");
++	printk("hello");
+ 	struct zns_ftl *zns_ftl = (struct zns_ftl *)ns->ftls;
+ 	struct zone_descriptor *zone_descs = zns_ftl->zone_descs;
+ 	struct nvme_rw_command *cmd = &(req->cmd->rw);

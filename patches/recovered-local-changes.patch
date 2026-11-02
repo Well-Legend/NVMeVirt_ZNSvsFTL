@@ -1,0 +1,156 @@
+diff --git a/Kbuild b/Kbuild
+index 11bb91b..edf505e 100644
+--- a/Kbuild
++++ b/Kbuild
+@@ -1,7 +1,7 @@
+ # Select one of the targets to build
+-CONFIG_NVMEVIRT_NVM := y
++#CONFIG_NVMEVIRT_NVM := y
+ #CONFIG_NVMEVIRT_SSD := y
+-#CONFIG_NVMEVIRT_ZNS := y
++CONFIG_NVMEVIRT_ZNS := y
+ #CONFIG_NVMEVIRT_KV := y
+ 
+ obj-m   := nvmev.o
+diff --git a/ssd_config.h b/ssd_config.h
+index 2c661e8..ba2d085 100644
+--- a/ssd_config.h
++++ b/ssd_config.h
+@@ -189,14 +189,14 @@ static_assert((ZONE_SIZE % DIES_PER_ZONE) == 0);
+ #define NAND_CHANNELS (8)
+ #define LUNS_PER_NAND_CH (4)
+ #define PLNS_PER_LUN (1) /* not used*/
+-#define DIES_PER_ZONE (NAND_CHANNELS * LUNS_PER_NAND_CH)
++#define DIES_PER_ZONE (1)
+ 
+ #define FLASH_PAGE_SIZE KB(32)
+ #define ONESHOT_PAGE_SIZE (FLASH_PAGE_SIZE * 3)
+ /*In an emulator environment, it may be too large to run an application
+   which requires a certain number of zones or more.
+   So, adjust the zone size to fit your environment */
+-#define ZONE_SIZE GB(2ULL)
++#define ZONE_SIZE MB(256)
+ 
+ static_assert((ONESHOT_PAGE_SIZE % FLASH_PAGE_SIZE) == 0);
+ 
+diff --git a/zns_ftl.c b/zns_ftl.c
+index 8d1b758..e7fc3ec 100644
+--- a/zns_ftl.c
++++ b/zns_ftl.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ 
+ #include <linux/ktime.h>
++#include <linux/atomic.h>
+ #include <linux/sched/clock.h>
+ 
+ #include "nvmev.h"
+@@ -125,13 +126,14 @@ void zns_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *m
+ {
+ 	struct ssd *ssd;
+ 	struct zns_ftl *zns_ftl;
+-
+ 	struct ssdparams spp;
+ 	struct znsparams zpp;
+ 
+ 	const uint32_t nr_parts = 1; /* Not support multi partitions for zns*/
+ 	NVMEV_ASSERT(nr_parts == 1);
+ 
++	// spin_lock_init(&zns_zone_lock);
++
+ 	ssd = kmalloc(sizeof(struct ssd), GFP_KERNEL);
+ 	ssd_init_params(&spp, size, nr_parts);
+ 	ssd_init(ssd, &spp, cpu_nr_dispatcher);
+@@ -186,6 +188,19 @@ static void zns_flush(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
+ 	return;
+ }
+ 
++static atomic_t active_ios = ATOMIC_INIT(0);
++static atomic_t max_active_ios = ATOMIC_INIT(0);
++static atomic_t total_writes = ATOMIC_INIT(0);
++static atomic_t total_reads = ATOMIC_INIT(0);
++
++static void update_max_active(void)
++{
++    int cur = atomic_read(&active_ios);
++    int prev = atomic_read(&max_active_ios);
++    if (cur > prev)
++        atomic_set(&max_active_ios, cur);
++}
++
+ bool zns_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
+ {
+ 	struct nvme_command *cmd = req->cmd;
+@@ -193,15 +208,20 @@ bool zns_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struct
+ 	/*still not support multi partitions ...*/
+ 	NVMEV_ASSERT(ns->nr_parts == 1);
+ 
++	atomic_inc(&active_ios);
++    update_max_active();
++
+ 	switch (cmd->common.opcode) {
+ 	case nvme_cmd_write:
+ 	case nvme_cmd_zone_append:
++		atomic_inc(&total_writes);
+ 		if (!zns_write(ns, req, ret))
+-			return false;
++			goto out;
+ 		break;
+ 	case nvme_cmd_read:
++		atomic_inc(&total_reads);
+ 		if (!zns_read(ns, req, ret))
+-			return false;
++			goto out;
+ 		break;
+ 	case nvme_cmd_flush:
+ 		zns_flush(ns, req, ret);
+@@ -217,6 +237,14 @@ bool zns_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struct
+ 			    nvme_opcode_string(cmd->common.opcode), cmd->common.opcode);
+ 		break;
+ 	}
+-
++	// 印出目前統計狀況
++    #printk(KERN_INFO "[ZNS] Opcode=%d | Active IOs=%d | Max Active=%d | Total W=%d | Total R=%d\n",
++       cmd->common.opcode,
++       atomic_read(&active_ios),
++       atomic_read(&max_active_ios),
++       atomic_read(&total_writes),
++       atomic_read(&total_reads));
++out:
++    atomic_dec(&active_ios);
+ 	return true;
+ }
+diff --git a/zns_read_write.c b/zns_read_write.c
+index d7c8dae..a1d0163 100644
+--- a/zns_read_write.c
++++ b/zns_read_write.c
+@@ -3,6 +3,12 @@
+ #include "nvmev.h"
+ #include "ssd.h"
+ #include "zns_ftl.h"
++#include <linux/atomic.h>
++#include <linux/spinlock.h>
++
++static atomic_t zns_active_zones = ATOMIC_INIT(0);
++static atomic_t zns_max_active_zones = ATOMIC_INIT(0);
++static spinlock_t zns_zone_lock;
+ 
+ static inline uint32_t __nr_lbas_from_rw_cmd(struct nvme_rw_command *cmd)
+ {
+@@ -381,6 +387,7 @@ out:
+ 
+ bool zns_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
+ {
++	#printk("hello");
+ 	struct zns_ftl *zns_ftl = (struct zns_ftl *)ns->ftls;
+ 	struct zone_descriptor *zone_descs = zns_ftl->zone_descs;
+ 	struct nvme_rw_command *cmd = &(req->cmd->rw);
+@@ -388,7 +395,7 @@ bool zns_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_resu
+ 
+ 	// get zone from start_lba
+ 	uint32_t zid = lpn_to_zone(zns_ftl, slpn);
+-
++	
+ 	NVMEV_DEBUG("%s slba 0x%llx zone_id %d \n", __func__, cmd->slba, zid);
+ 
+ 	if (zone_descs[zid].zrwav == 0)

@@ -1,0 +1,13 @@
+{
+  "archive_date": "2026-11-02",
+  "compile_header_tree": "/usr/src/linux-headers-6.8.0-147-generic",
+  "compiler": "gcc-13 (Ubuntu 13.3.0)",
+  "modules_loaded_during_recovery": false,
+  "benchmarks_rerun": false,
+  "credential_pattern_scan": "passed; no GitHub token, private key, AWS access key or credential URL pattern found",
+  "large_file_check": "no source asset over 50 MiB",
+  "ftl_module_build": "passed",
+  "zns_module_build": "passed with explicit build-syntax-fix.patch",
+  "recovered_vendor_source_kept_unchanged": true,
+  "zonefs_tools_commit": "a8f1f6ac72340525f345ca9920a3a3a64c818e04"
+}

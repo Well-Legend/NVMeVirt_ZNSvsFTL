@@ -1,0 +1,801 @@
+#!/bin/bash
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Copyright (C) 2019 Western Digital Corporation or its affiliates.
+#
+
+blkzone=$(type -p blkzone 2>/dev/null)
+
+function drop_inode_cache()
+{
+	echo 2 > /proc/sys/vm/drop_caches
+}
+
+function devname()
+{
+	basename "$(realpath $1)"
+}
+
+function sysfs_max_active_seq_files()
+{
+	cat "/sys/fs/zonefs/$(devname $1)/max_active_seq_files"
+}
+
+function sysfs_nr_active_seq_files()
+{
+	cat "/sys/fs/zonefs/$(devname $1)/nr_active_seq_files"
+}
+
+function sysfs_max_wro_seq_files()
+{
+	cat "/sys/fs/zonefs/$(devname $1)/max_wro_seq_files"
+}
+
+function sysfs_nr_wro_seq_files()
+{
+	cat "/sys/fs/zonefs/$(devname $1)/nr_wro_seq_files"
+}
+
+function get_nr_zones()
+{
+	${blkzone} report "$1" | wc -l || exit 0
+}
+
+function get_nr_cnv_zones()
+{
+	${blkzone} report "$1" | grep -c "CONVENTIONAL" || exit 0
+}
+
+function get_nr_seq_zones()
+{
+	${blkzone} report "$1" | grep -c "SEQ_WRITE_" || exit 0
+}
+
+function get_zone_sectors()
+{
+	cat "/sys/class/block/$(devname $1)/queue/chunk_sectors"
+}
+
+function get_zone_append_max_bytes()
+{
+	cat "/sys/class/block/$(devname $1)/queue/zone_append_max_bytes"
+}
+
+function get_write_max_bytes()
+{
+	local maxkb=$(cat "/sys/class/block/$(devname $1)/queue/max_hw_sectors_kb")
+
+	echo $(( maxkb * 1024 ))
+}
+
+function get_logical_block_size()
+{
+	cat "/sys/class/block/$(devname $1)/queue/logical_block_size"
+}
+
+function get_max_open_zones()
+{
+	local bdev="$(devname $1)"
+
+	if [ -f "/sys/class/block/$bdev/queue/max_open_zones" ]; then
+		cat "/sys/class/block/$bdev/queue/max_open_zones"
+	else
+		echo "0"
+	fi
+}
+
+function get_max_active_zones()
+{
+	local bdev="$(devname $1)"
+
+	if [ -f "/sys/class/block/$bdev/queue/max_active_zones" ]; then
+		cat "/sys/class/block/$bdev/queue/max_active_zones"
+	else
+		echo "0"
+	fi
+}
+
+function zone_info()
+{
+	${blkzone} report --count 1 --offset "$2" "$1" || exit 0
+}
+
+function zone_is_conventional()
+{
+	echo "$(zone_info $1 $2)" | grep -q "CONVENTIONAL" && return 0 || return 1
+}
+
+function zone_is_full()
+{
+	echo "$(zone_info $1 $2)" | grep -q "zcond:14(fu)" && return 0 || return 1
+}
+
+function blkzone_has_zone_capacity()
+{
+	echo "$(zone_info $1 0)" | grep -q "cap " && return 0 || return 1
+
+}
+
+function get_zone_capacity_sectors()
+{
+	c=$(echo "$(zone_info $1 $2)" | cut -d "," -f3 | cut -d" " -f3)
+	echo $((c))
+}
+
+function get_zone_capacity_bytes()
+{
+	echo $(( $(get_zone_capacity_sectors "$1" "$2") * 512 ))
+}
+
+function get_total_zone_capacity_sectors()
+{
+	local total_cap=0
+
+	# Skip the first zone as it contains the super block
+	while read -r c_hex; do
+		c=$((c_hex))
+		total_cap=$(( total_cap + c ))
+	done < <(blkzone report -o "$zone_sectors" "$1" | cut -d "," -f3 | cut -d" " -f3)
+
+	echo $total_cap
+}
+
+function exit_skip()
+{
+	echo " --> skipped: $1"
+	exit 2
+}
+
+function exit_failed()
+{
+	echo "$1"
+	exit 1
+}
+
+function clear_sb()
+{
+	local nrcnv=$(get_nr_cnv_zones "$1")
+
+	# Clear super block for -f tests
+	if [ $nrcnv == 0 ]; then
+		blkzone reset --offset 0 -c 1 "$1" ||
+			(echo "Reset super block zone failed"; exit 1)
+		# Resetting a zone does not clear the page cache of cached zone data
+		# pages. Take a big hammer and clear the page cache to avoid access
+		# to stale data.
+		echo 1 > /proc/sys/vm/drop_caches
+	else
+		dd if=/dev/zero of="$1" bs=4096 oflag=direct count=1 ||
+			(echo "Clear super block failed"; exit 1)
+	fi
+}
+
+function zonefs_mkfs()
+{
+	IFS=' ';
+	read -r -a args <<< "$1"
+
+	mkzonefs -f "${args[@]}" || \
+		exit_failed " --> mkzonefs FAILED with arguments \"${args[*]}\""
+}
+
+function zonefs_mount()
+{
+	IFS=' ';
+	read -r -a args <<< "$1"
+
+	mount -t zonefs "${args[@]}" "$zonefs_mntdir" || \
+		exit_failed " --> mount FAILED with arguments \"${args[*]} $zonefs_mntdir\""
+}
+
+function zonefs_mount_err()
+{
+	IFS=' ';
+	read -r -a args <<< "$1"
+
+	mount -t zonefs "${args[@]}" "$zonefs_mntdir" && \
+		exit_failed " --> mount SUCCESS with arguments \"${args[*]} $zonefs_mntdir\" (should FAIL)"
+}
+
+function zonefs_umount()
+{
+	# Make sure udev is not looking at the FS
+	udevadm settle >> /dev/null 2>&1
+
+	umount "$zonefs_mntdir" || \
+		exit_failed " --> umount FAILED"
+}
+
+function get_perm()
+{
+	stat -c "%a" "$1"
+}
+
+function check_file_perm()
+{
+	perm="$(get_perm "$1")"
+        if [ "$perm" == "0" ]; then
+		perm="000"
+	fi
+
+        if [ "$perm" != "$2" ]; then
+		echo "file $1: invalid permission $perm (expected $2)"
+		exit 1
+        fi
+}
+
+function get_ino()
+{
+	stat -c "%i" "$1" || \
+		exit_failed " --> Failed to get inode number of file $1"
+}
+
+function check_dir_ino()
+{
+	local dir="$1"
+	local expected_ino=$2
+	local ino
+
+	ino=$(get_ino "${dir}")
+	if [ ${ino} != ${expected_ino} ]; then
+		echo " --> Invalid inode number for directory ${dir}"
+		echo " --> Expected ${expected_ino}, got ${ino}"
+		exit 1
+	fi
+}
+
+function check_files_ino()
+{
+	local dir="$1"
+	local nrfiles=$2
+	local expected_ino=$3
+	local ino
+	local f
+
+	#
+	# Note: this needs to be improved as this assumes that files under
+	# a zone type directory are all from contiguous zones. This may not
+	# be the case for all devices as conventional zones can be anywhere.
+	# In practice, this is not an issue though.
+	#
+	for (( f=0; f<${nrfiles}; f++ )); do
+		ino=$(get_ino "${dir}/$f")
+		if [ ${ino} != ${expected_ino} ]; then
+			echo " --> Invalid inode number for file ${dir}/$f"
+			echo " --> Expected ${expected_ino}, got ${ino}"
+			exit 1
+		fi
+
+		expected_ino=$(( expected_ino + 1 ))
+	done
+}
+
+function check_perm()
+{
+	if [ -d "$zonefs_mntdir/cnv/" ]; then
+		list=$(stat -c "%n %a" "$zonefs_mntdir"/cnv/[0-9]*)
+		while read -r line; do
+
+			fp=(${line})
+			f=${fp[0]##*/}
+			perm=${fp[1]}
+
+			if [ "$perm" != "$1" ]; then
+				echo "cnv file $f: invalid permission $perm (expected $1)"
+				exit 1
+			fi
+
+		done <<< "$list"
+	fi
+
+	pushd "$zonefs_mntdir" > /dev/null 2>&1 || exit
+	list=$(stat -c "%n %a" seq/[0-9]*)
+	popd > /dev/null 2>&1 || exit
+	while read -r line; do
+
+		fp=(${line})
+		f=${fp[0]##*/}
+		perm=${fp[1]}
+
+		if [ "$perm" != "$1" ]; then
+			echo "seq file $f: invalid permission $perm (expected $1)"
+			exit 1
+		fi
+
+	done <<< "$list"
+}
+
+function get_uid_gid()
+{
+	stat -c "%u %g" "$1"
+}
+
+function check_file_uid_gid()
+{
+	ug="$(get_uid_gid "$1")"
+	if [ "$ug" != "$2" ]; then
+		echo "file $1: invalid UID/GID $ug (expected $2)"
+		exit 1
+	fi
+}
+
+function check_uid_gid()
+{
+	if [ -d "$zonefs_mntdir/cnv/" ]; then
+		list=$(stat -c "%n %u %g" "$zonefs_mntdir"/cnv/[0-9]*)
+		while read -r line; do
+
+			fug=(${line})
+			f=${fug[0]##*/}
+			uid=${fug[1]}
+			gid=${fug[2]}
+
+			if [ "$uid" != "$1" ]; then
+				echo "cnv file $f: invalid UID $uid (expected $1)"
+				exit 1
+			fi
+			if [ "$gid" != "$2" ]; then
+				echo "cnv file $f: invalid GID $gid (expected $2)"
+				exit 1
+			fi
+
+		done <<< "$list"
+	fi
+
+	pushd "$zonefs_mntdir" > /dev/null 2>&1 || exit
+	list=$(stat -c "%n %u %g" seq/[0-9]*)
+	popd > /dev/null 2>&1 || exit
+	while read -r line; do
+
+		fug=(${line})
+		f=${fug[0]##*/}
+		uid=${fug[1]}
+		gid=${fug[2]}
+
+		if [ "$uid" != "$1" ]; then
+			echo "seq file $f: invalid UID $uid (expected $1)"
+			exit 1
+		fi
+		if [ "$gid" != "$2" ]; then
+			echo "seq file $f: invalid GID $gid (expected $2)"
+			exit 1
+		fi
+
+	done <<< "$list"
+}
+
+function truncate_file()
+{
+	truncate --no-create --size="$2" "$1"
+}
+
+function file_size()
+{
+	stat -c "%s" "$1"
+}
+
+function check_file_size()
+{
+	local file="$1"
+	local efsz="$2"
+	local efsz2="$3"
+	local fsz=$(file_size "${file}")
+
+	if [ $# == 2 ]; then
+		[[ "${fsz}" == "${efsz}" ]] || \
+			exit_failed " --> Invalid file size ${fsz} B, expected ${efsz} B"
+		return 0
+	fi
+
+	if [ "${fsz}" != "${efsz}" ] && [ "${fsz}" != "${efsz2}" ]; then
+		exit_failed " --> Invalid file size ${fsz} B, expected ${efsz} or ${efsz2} B"
+	fi
+}
+
+function file_max_size()
+{
+	nr_blocks=$(stat -c "%b" "$1")
+	block_size=$(stat -c "%B" "$1")
+	echo "$(( nr_blocks * block_size ))"
+}
+
+function aggr_cnv_size()
+{
+	size=$(file_max_size "$zonefs_mntdir"/cnv/0)
+	two_zones_size=$((zone_sectors * 2 * 512))
+
+	if $short && ((two_zones_size < size)); then
+		size="${two_zones_size}"
+	fi
+
+	echo "${size}"
+}
+
+function check_size()
+{
+	aggr_cnv=$1
+
+	if [ -d "$zonefs_mntdir/cnv/" ]; then
+		# Note: conventional zone capacity is always equal to the zone size
+		if $aggr_cnv; then
+			expected_sz=$(( zone_bytes * (nr_cnv_zones - 1) ))
+		else
+			expected_sz=$zone_bytes
+		fi
+
+		list=$(stat -c "%n %s" "$zonefs_mntdir"/cnv/[0-9]*)
+		while read -r line; do
+
+			fsz=(${line})
+			f=${fsz[0]##*/}
+			sz=${fsz[1]}
+
+			if [ "$sz" != "$expected_sz" ]; then
+				echo "cnv file $f: invalid size $sz B (expected $expected_sz B)"
+				exit 1
+			fi
+
+		done <<< "$list"
+	fi
+
+	pushd "$zonefs_mntdir" > /dev/null 2>&1 || exit
+	list=$(stat -c "%n %s" seq/[0-9]*)
+	popd > /dev/null 2>&1 || exit
+	while read -r line; do
+
+		fsz=(${line})
+		f=${fsz[0]##*/}
+		sz=${fsz[1]}
+
+		if [ "$sz" != "0" ]; then
+			echo "seq file $f: invalid size $sz B (expected 0 B)"
+			exit 1
+		fi
+
+	done <<< "$list"
+}
+
+function create_nullb()
+{
+	local zoned=$1
+	local n=0
+
+	modprobe null_blk nr_devices=0
+
+	while [ 1 ]; do
+		if [ ! -b "/dev/nullb$n" ]; then
+			break
+		fi
+		n=$(( n + 1 ))
+	done
+
+	cfg="/sys/kernel/config/nullb/nullb$n"
+	mkdir "$cfg" || exit_failed "Create test null_blk device failed"
+
+	echo 1 > "${cfg}/zoned"
+	echo 2 > "${cfg}/queue_mode"
+	echo 2 > "${cfg}/irqmode"
+	echo 2000 > "${cfg}/completion_nsec"
+
+	echo 2048 > "${cfg}/size"
+	echo 1024 > "${cfg}/hw_queue_depth"
+	echo 1 > "${cfg}/memory_backed"
+
+	echo ${zoned} > "${cfg}/zoned"
+	if [ "${zoned}" == "1" ]; then
+		echo 32 > "${cfg}/zone_size"
+		echo 10 > "${cfg}/zone_nr_conv"
+		echo 8 > "${cfg}/zone_max_open"
+		echo 8 > "${cfg}/zone_max_active"
+	fi
+
+	echo 1 > "${cfg}/power" || exit_failed "Start null_blk device $n failed"
+
+	echo "$n" > "${logdir}/.zonefs_test_nullbn"
+
+	echo "$n"
+}
+
+function create_regular_nullb()
+{
+	create_nullb 0 || \
+		exit_failed " --> Create regular null_blk device failed"
+}
+
+function create_zoned_nullb()
+{
+	create_nullb 1 || \
+		exit_failed " --> Create zoned null_blk device failed"
+}
+
+function destroy_nullb()
+{
+	local cfg="/sys/kernel/config/nullb/nullb$1"
+
+	echo 0 > "${cfg}/power"
+	rmdir "${cfg}"
+
+	rmmod null_blk > /dev/null 2>&1
+
+	rm -f "${logdir}/.zonefs_test_nullbn"
+}
+
+function ls_nr_files()
+{
+	ls -U "$1" | wc -l || exit_failed " --> ls FAILED"
+}
+
+function stat_nr_files()
+{
+        stat -f -c "%c" "$1"
+}
+
+function block_number()
+{
+        stat -f -c "%b" "$1"
+}
+
+function block_size()
+{
+        stat -f -c "%S" "$1"
+}
+
+function require_program()
+{
+	type -p "$1" 2> /dev/null || exit_skip "program $1 not available"
+}
+
+function require_cnv_files()
+{
+	[[ ${nr_cnv_files} -ne 0 ]] || exit_skip "no conventional files"
+}
+
+function require_sysfs()
+{
+	[[ ${zonefs_has_sysfs} -eq 1 ]] || exit_skip "sysfs attributes not supported"
+}
+
+function require_null_blk()
+{
+	modinfo null_blk || exit_failed "null_blk module is not available"
+}
+
+function require_nullb_readonly()
+{
+	modprobe null_blk nr_devices=0 || exit_failed "Failed to load null_blk module"
+	have_zone_readonly=$(grep -c "zone_readonly" "/sys/kernel/config/nullb/features")
+	rmmod null_blk > /dev/null 2>&1
+
+	[[ ${have_zone_readonly} -eq 0 ]] && exit_skip "null_blk does not support zone_readonly config"
+}
+
+function require_nullb_offline()
+{
+	modprobe null_blk nr_devices=0 || exit_failed "Failed to load null_blk module"
+	have_zone_offline=$(grep -c "zone_offline" "/sys/kernel/config/nullb/features")
+	rmmod null_blk > /dev/null 2>&1
+
+	[[ ${have_zone_offline} -eq 0 ]] && exit_skip "null_blk does not support zone_offline config"
+}
+
+function require_write_mounted_dev()
+{
+	local dev="$1"
+	local ofst
+
+	cfg="/boot/config-$(uname -r)"
+	if [ -f "${cfg}" ]; then
+		dwm="$(grep CONFIG_BLK_DEV_WRITE_MOUNTED "${cfg}")"
+		echo "### ${dwm}"
+		[[ "${dwm}" == "CONFIG_BLK_DEV_WRITE_MOUNTED=n" ]] && \
+			exit_skip "Writing to mounted block devices is not allowed"
+		return 0
+	fi
+
+	cfg="/proc/config.gz"
+	if [ -f "${cfg}" ]; then
+		dwm="$(zcat "${cfg}" | grep CONFIG_BLK_DEV_WRITE_MOUNTED)"
+		[[ "${dwm}" == "CONFIG_BLK_DEV_WRITE_MOUNTED=n" ]] && \
+			exit_skip "Writing to mounted block devices is not allowed"
+		return 0
+	fi
+
+	# Fallback to trying if we can write the device while it is mounted
+	zonefs_mkfs "${dev}"
+	zonefs_mount "${dev}"
+
+	ofst=$(( (2 * zone_bytes) / 4096 ))
+
+	dd if=/dev/zero of="${dev}" \
+		oflag=direct bs=4096 count=1 seek=${ofst} \
+		conv=nocreat,notrunc
+	ret=$?
+	zonefs_umount
+
+	[[ ${ret} -eq 0 ]] || exit_skip "Writing to mounted block devices is not allowed"
+}
+
+function set_nullb_first_seq_zone_readonly()
+{
+	local cfg="/sys/kernel/config/nullb/nullb$1"
+
+	echo $(( 10 * 32 * 1048576 / 512 )) > "${cfg}/zone_readonly"
+}
+
+function set_nullb_first_seq_zone_offline()
+{
+	local cfg="/sys/kernel/config/nullb/nullb$1"
+
+	echo $(( 10 * 32 * 1048576 / 512 )) > "${cfg}/zone_offline"
+}
+
+function fs_ro()
+{
+	grep "${zonefs_mntdir}" "/proc/mounts" | grep -c "ro,"
+}
+
+function check_fs_is_readonly()
+{
+	[[ $(fs_ro) -eq 1 ]] || exit_failed "File system is not readonly"
+}
+
+function check_fs_is_writable()
+{
+	[[ $(fs_ro) -eq 0 ]] || exit_failed "File system is readonly"
+}
+
+function write_file()
+{
+	local file="$1"
+	local sz=$2
+	local fsz=$(file_size "${file}")
+
+	dd if=/dev/zero of="${file}" \
+		oflag=direct,append bs=${sz} count=1 \
+		conv=nocreat,notrunc || \
+		exit_failed " --> write ${sz} B to ${file} FAILED"
+	check_file_size "${file}" $(( fsz + sz ))
+}
+
+function write_file_err()
+{
+	local file="$1"
+	local sz=$2
+	local expected_fsz=$3
+	local expected_fsz2=$4
+
+	dd if=/dev/zero of="${file}" \
+		oflag=direct,append bs=${sz} count=1 \
+		conv=nocreat,notrunc && \
+		exit_failed " --> write ${sz} B to ${file} SUCCESS (should FAIL)"
+	check_file_size "${file}" ${expected_fsz} ${expected_fsz2}
+}
+
+function write_file_async_err()
+{
+	local file="$1"
+	local sz=$2
+	local expected_fsz=$3
+
+	tools/zio --write --fflag=direct --ofst=$(file_size "${file}") \
+        	--async=1 --size=${sz} --nio=1 "${file}" && \
+		exit_failed " --> async write ${sz} B to ${file} SUCCESS (should FAIL)"
+	check_file_size "${file}" ${expected_fsz}
+}
+
+function write_file_zone()
+{
+	local dev="$1"
+	local file="$2"
+	local ofst
+	local fino
+	local fsz
+
+	fino=$(get_ino "${file}")
+	fsz=$(file_size "${file}")
+	ofst=$(( (fino * zone_bytes + fsz) / 4096 ))
+
+	dd if=/dev/zero of="${dev}" \
+		oflag=direct bs=4096 count=1 seek=${ofst} \
+		conv=nocreat,notrunc || \
+		exit_failed " --> write 4096 B to ${dev} in zone at $(( fino * zone_sectors )) FAILED"
+}
+
+function min()
+{
+	local a=$1
+	local b=$2
+
+	echo $((a < b ? a : b))
+}
+
+function max()
+{
+	local a=$1
+	local b=$2
+
+	echo $((a > b ? a : b))
+}
+
+function get_dev_path_by_id()
+{
+	local d
+
+	for d in /sys/block/* /sys/block/*/*; do
+		if [[ ! -r "${d}/dev" ]]; then
+			continue
+		fi
+		if [[ "${1}" == "$(<"${d}/dev")" ]]; then
+			echo "/dev/${d##*/}"
+			return 0
+		fi
+	done
+	return 1
+}
+
+function set_dm_io_scheduler()
+{
+	local bdev="$1"
+	local sched="$2"
+	local dest_dev_id dest_dev path
+
+	while read -r dest_dev_id; do
+		if ! dest_dev=$(get_dev_path_by_id "${dest_dev_id}"); then
+			continue
+		fi
+		path=${dest_dev/dev/sys\/block}/queue/scheduler
+		if [[ ! -w ${path} ]]; then
+			echo "Can not set scheduler of device mapper destination: ${dest_dev}"
+			return 1
+		fi
+		echo "${sched}" > "${path}"
+	done < <(dmsetup table "$(<"/sys/block/$bdev/dm/name")" |
+			 sed -n  's/.* \([0-9]*:[0-9]*\).*/\1/p')
+}
+
+function dev_has_dm_map()
+{
+	local dev=${1}
+	local target_type=${2}
+	local dm_name
+
+	[[ $(type -P "dmsetup") ]] ||
+		{
+			echo "dmsetup not found."
+			exit 1
+		}
+
+	dm_name=$(<"/sys/block/$dev/dm/name")
+	if ! dmsetup status "${dm_name}" | grep -qe "${target_type}"; then
+		return 1
+	fi
+
+	if dmsetup status "${dm_name}" | grep -v "${target_type}"; then
+		return 1
+	fi
+
+	return 0
+}
+
+function set_io_scheduler()
+{
+	local bdev="$1"
+	local sched="$2"
+
+	if [ -w "/sys/block/${bdev}/queue/scheduler" ]; then
+		echo "${sched}" > "/sys/block/${bdev}/queue/scheduler"
+		return 0
+	fi
+
+	if [ -r "/sys/block/$bdev/dm/name" ] &&
+		( dev_has_dm_map "$bdev" linear || dev_has_dm_map "$bdev" flakey ||
+		  dev_has_dm_map "$bdev" crypt ); then
+		set_dm_io_scheduler "${bdev}" "${sched}"
+		return 0
+	fi
+
+	echo "Failed to set I/O scheduler"
+	return 1
+}
+

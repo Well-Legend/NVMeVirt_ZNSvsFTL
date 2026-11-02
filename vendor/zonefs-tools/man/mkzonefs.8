@@ -1,0 +1,82 @@
+.\"  SPDX-License-Identifier: GPL-2.0-or-later
+.\"
+.\"  Copyright (C) 2019, Western Digital Corporation or its affiliates.
+.\"  Written by Damien Le Moal <damien.lemoal@wdc.com>
+.\"
+.TH mkzonefs 8
+.SH NAME
+mkzonefs \- Create a zonefs file system on a zoned block device
+
+.SH SYNOPSIS
+.B mkzonefs
+[
+.B \-h|\-\-help
+]
+[
+.B \-v
+]
+[
+.B \-f
+]
+[
+.B \-L
+.I label
+]
+[
+.B \-o
+.I features
+]
+.I device
+
+.SH DESCRIPTION
+.B mkzonefs
+is used to create a zonefs file system on a zoned block device.
+
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Display a short usage message and return
+
+.TP
+.BI \-v
+Enable verbose output.
+
+.TP
+.BI \-f
+Overwrite existing file system format on the device.
+
+.TP
+.BI \-L " label"
+Specify a label (volume name). A label must not exceed 32 characters.
+
+.TP
+.BI \-o " features"
+.RS
+Specify optional features. Features are comma separated and may take an
+argument using the equal ("=") sign. The following features are supported.
+.TP
+.BR aggr_cnv
+Aggregate contiguous conventional zones into a single file.
+Default: disabled (create one file per zone).
+.TP
+.BR uid =\fIUID\fR
+Create files with \fIUID\fR as the owner user. The default is the "root" user
+(UID 0).
+.TP
+.BR gid =\fIGID\fR
+Create files with \fIGID\fR as the group owner. The default is the "root" group
+(GID 0).
+.TP
+.BR perm =\fIpermissions\fR
+Create files with \fIpermissions\fR as access rights. The default is "640".
+.RE
+
+.SH SEE ALSO
+.BR zonefs (5)
+
+.SH AUTHOR
+This version of \fBmkzonefs\fR was written by Damien Le Moal.
+
+.SH AVAILABILITY
+.B mkzonefs
+is available from https://github.com/westerndigitalcorporation/zonefs-tools/

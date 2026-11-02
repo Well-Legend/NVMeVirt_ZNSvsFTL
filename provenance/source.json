@@ -1,0 +1,11 @@
+{
+  "upstream": "https://github.com/snu-csl/nvmevirt",
+  "upstream_commit": "c93e88c374917610ba6d8cc474e0376a9911ce0b",
+  "source_guest": "NVMeVirt_",
+  "guest_path": "/home/well/SCDEMST/lab1/nvmevirt",
+  "source_is_last_saved_worktree": true,
+  "historical_binary": "nvmevirt_builds/nvmev_ftl.ko",
+  "smaller_guest": "NVMeVirt has an empty SCDEMST directory; no alternate driver implementation was recovered there.",
+  "recovery_does_not_reproduce_measurements": true,
+  "zonefs_tools_commit": "a8f1f6ac72340525f345ca9920a3a3a64c818e04"
+}
